@@ -4,6 +4,8 @@ Handles the full conversation loop with tool use.
 """
 
 import json
+from collections.abc import Iterator
+
 import anthropic
 from config import LLM_MODEL
 from registry import ToolRegistry, ToolDefinition
@@ -49,11 +51,19 @@ class Agent:
         return self.registry.list_tools()
 
     def run(self, user_message: str) -> str:
+        """Run the agent loop and return the full text response."""
+        return "".join(
+            event["delta"] for event in self.run_stream(user_message)
+            if event["type"] == "text"
+        )
+
+    def run_stream(self, user_message: str) -> Iterator[dict]:
         """
-        Run the full agent loop:
+        Run the full agent loop, yielding events as they happen:
         1. Add user message to history
-        2. Send to Claude with tools
+        2. Stream Claude's reply → {"type": "text", "delta": ...}
         3. If Claude uses tools → run through Registry pipeline
+           → {"type": "tool", "name": ..., "status": "success" | "failed"}
         4. Loop until Claude gives final text response
         """
         print(f"\n{'#'*60}")
@@ -68,62 +78,51 @@ class Agent:
         tools = self.get_tools_for_claude()
 
         while True:
-            print(f"\n>>> Calling Claude LLM...")
-            response = self.client.messages.create(
+            print(f"\n>>> Calling Claude LLM (stream)...")
+            with self.client.messages.stream(
                 model=self.model,
                 max_tokens=4096,
                 system=SYSTEM_PROMPT,
                 tools=tools,
                 messages=self.conversation_history,
-            )
+            ) as stream:
+                for delta in stream.text_stream:
+                    yield {"type": "text", "delta": delta}
+                response = stream.get_final_message()
 
             print(f">>> Claude stop_reason: {response.stop_reason}")
 
-            # Final response - anything but tool_use (end_turn, max_tokens, ...) ends the loop
-            if response.stop_reason != "tool_use":
-                # Add assistant response to history
-                self.conversation_history.append({
-                    "role": "assistant",
-                    "content": response.content,
-                })
-
-                text_parts = [
-                    block.text for block in response.content
-                    if hasattr(block, "text")
-                ]
-                final_response = "\n".join(text_parts)
-
-                print(f"\n{'#'*60}")
-                print(f"  ASSISTANT: {final_response[:500]}")
-                if len(final_response) > 500:
-                    print(f"  ... [truncated, total {len(final_response)} chars]")
-                print(f"{'#'*60}\n")
-
-                return final_response
-
-            # Process tool calls
             self.conversation_history.append({
                 "role": "assistant",
                 "content": response.content,
             })
 
+            # Final response - anything but tool_use (end_turn, max_tokens, ...) ends the loop
+            if response.stop_reason != "tool_use":
+                print(f"\n{'#'*60}")
+                print(f"  ASSISTANT: done ({response.stop_reason})")
+                print(f"{'#'*60}\n")
+                return
+
+            # Process tool calls
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    tool_name = block.name
-                    tool_input = block.input
-                    tool_use_id = block.id
-
                     # Run through the 6-step Registry pipeline
                     result = self.registry.call(
-                        tool_name=tool_name,
-                        arguments=tool_input,
+                        tool_name=block.name,
+                        arguments=block.input,
                         api_key=self.service_api_key,
                     )
+                    yield {
+                        "type": "tool",
+                        "name": block.name,
+                        "status": "failed" if "error" in result else "success",
+                    }
 
                     tool_results.append({
                         "type": "tool_result",
-                        "tool_use_id": tool_use_id,
+                        "tool_use_id": block.id,
                         "content": json.dumps(result, ensure_ascii=False, default=str),
                     })
 

@@ -99,6 +99,10 @@
             border-radius: 10px;
             font-family: monospace;
         }
+        .tool-tag.failed {
+            background: #7f1d1d;
+            color: #fca5a5;
+        }
 
         /* Typing indicator */
         .typing {
@@ -277,28 +281,62 @@ function autoResize(el) {
     el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 }
 
-function addMessage(text, role, toolsUsed = []) {
+function scrollToBottom() {
+    const container = document.getElementById('chatContainer');
+    container.scrollTop = container.scrollHeight;
+}
+
+function addMessage(text, role) {
     document.getElementById('welcome')?.remove();
 
-    const container = document.getElementById('chatContainer');
     const div = document.createElement('div');
     div.className = 'message ' + role;
-    div.textContent = text;
+    const body = document.createElement('span');
+    body.textContent = text;
+    div.appendChild(body);
 
-    if (toolsUsed.length > 0) {
-        const badge = document.createElement('div');
+    document.getElementById('chatContainer').appendChild(div);
+    scrollToBottom();
+    return div;
+}
+
+function appendText(bubble, delta) {
+    bubble.firstChild.textContent += delta;
+    scrollToBottom();
+}
+
+function addToolTag(bubble, name, status) {
+    let badge = bubble.querySelector('.tools-badge');
+    if (!badge) {
+        badge = document.createElement('div');
         badge.className = 'tools-badge';
-        toolsUsed.forEach(t => {
-            const tag = document.createElement('span');
-            tag.className = 'tool-tag';
-            tag.textContent = t;
-            badge.appendChild(tag);
-        });
-        div.appendChild(badge);
+        bubble.appendChild(badge);
     }
+    const tag = document.createElement('span');
+    tag.className = 'tool-tag' + (status === 'failed' ? ' failed' : '');
+    tag.textContent = name;
+    badge.appendChild(tag);
+    scrollToBottom();
+}
 
-    container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
+// Parse a fetch() response body as Server-Sent Events, yielding each JSON payload.
+async function* readSSE(res) {
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = '';
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        buffer += value;
+        const frames = buffer.split('\n\n');
+        buffer = frames.pop();
+        for (const frame of frames) {
+            const data = frame.split('\n')
+                .filter(line => line.startsWith('data: '))
+                .map(line => line.slice(6))
+                .join('\n');
+            if (data) yield JSON.parse(data);
+        }
+    }
 }
 
 function setTyping(active) {
@@ -331,16 +369,27 @@ async function sendMessage() {
     btn.disabled = true;
     setTyping(true);
 
+    let bubble = null;
     try {
-        const res = await fetch(API + '/api/chat', {
+        const res = await fetch(API + '/api/chat/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ session_id: SESSION_ID, message })
         });
-        const data = await res.json();
-        addMessage(data.response, 'assistant', data.tools_used);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+
+        for await (const event of readSSE(res)) {
+            if (!bubble) {
+                setTyping(false);
+                bubble = addMessage('', 'assistant');
+            }
+            if (event.type === 'text') appendText(bubble, event.delta);
+            else if (event.type === 'tool') addToolTag(bubble, event.name, event.status);
+            else if (event.type === 'error') appendText(bubble, '\nError: ' + event.message);
+        }
     } catch (err) {
-        addMessage('Error: ' + err.message, 'assistant');
+        if (bubble) appendText(bubble, '\nError: ' + err.message);
+        else addMessage('Error: ' + err.message, 'assistant');
     } finally {
         setTyping(false);
         btn.disabled = false;
